@@ -1497,12 +1497,12 @@ defmodule AutoNuke.Tui.Dashboard do
         param = Enum.at(prompt.item.params, length(prompt.answers))
 
         canvas
-        |> Canvas.put_text(r, col0 + 4, "#{param.label} (#{param.hint})")
-        |> Canvas.put_text(r + 1, col0 + 4, "> #{prompt.input}█", [:bright])
+        |> Canvas.put_text(r, col0 + 4, Canvas.clip("#{param.label} (#{param.hint})", w - 6))
+        |> Canvas.put_text(r + 1, col0 + 4, Canvas.clip("> #{prompt.input}█", w - 6), [:bright])
         |> then(fn acc ->
           case prompt.error do
             nil -> acc
-            error -> Canvas.put_text(acc, r + 2, col0 + 4, error, [:red, :bright])
+            error -> Canvas.put_text(acc, r + 2, col0 + 4, Canvas.clip(error, w - 6), [:red, :bright])
           end
         end)
         |> Canvas.put_text(row0 + h - 1, col0 + 2, " enter accept · esc back ", [:yellow])

@@ -2,6 +2,7 @@ defmodule AutoNuke.Operator.ControlRodsTest do
   use ExUnit.Case, async: false
 
   alias AutoNuke.Operator.ControlRods
+  alias AutoNuke.Smoother
   alias AutoNuke.Test.MockAPI
 
   # Callbacks are driven directly in the test process so MockAPI's
@@ -129,5 +130,48 @@ defmodule AutoNuke.Operator.ControlRodsTest do
 
     {:noreply, state} = ControlRods.handle_info({:core_temp, 341.2}, state)
     assert state.target == 341.2
+  end
+
+  describe "select_measurement/4" do
+    # Ten readings climbing 1°C a tick, ending at 339.
+    defp rising_history do
+      Enum.reduce(330..339, Smoother.new(10), &Smoother.add(&2, &1 * 1.0))
+    end
+
+    test "direct always uses the plain reading" do
+      assert ControlRods.select_measurement(:direct, 345.0, 339.0, rising_history()) == 339.0
+    end
+
+    test "predictive always uses the look-ahead" do
+      predicted = Smoother.extrapolate(rising_history(), 5)
+
+      assert ControlRods.select_measurement(:predictive, 340.0, 339.0, rising_history()) ==
+               predicted
+
+      assert predicted > 339.0
+    end
+
+    test "hybrid predicts while far from target" do
+      predicted = Smoother.extrapolate(rising_history(), 5)
+
+      assert ControlRods.select_measurement(:hybrid, 345.0, 339.0, rising_history()) == predicted
+      assert ControlRods.select_measurement(:hybrid, 330.0, 339.0, rising_history()) == predicted
+    end
+
+    test "hybrid reads directly once within 3°C of target, boundary included" do
+      assert ControlRods.select_measurement(:hybrid, 340.0, 339.0, rising_history()) == 339.0
+      assert ControlRods.select_measurement(:hybrid, 342.0, 339.0, rising_history()) == 339.0
+      assert ControlRods.select_measurement(:hybrid, 336.0, 339.0, rising_history()) == 339.0
+    end
+  end
+
+  test "hybrid is an accepted mode" do
+    set_temp(340.0, 2)
+    assert {:ok, %{mode: :hybrid}} = ControlRods.init({340.0, :hybrid})
+
+    state = init(340.0, 340.0)
+
+    assert {:reply, :ok, %{mode: :hybrid}} =
+             ControlRods.handle_call({:set_mode, :hybrid}, {self(), make_ref()}, state)
   end
 end

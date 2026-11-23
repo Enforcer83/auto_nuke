@@ -85,6 +85,7 @@ defmodule AutoNuke.Tui.OperatorsTest do
       assert Enum.any?(labels.(Op.SteamFlow), &(&1 =~ "override"))
       assert Enum.any?(labels.(Op.CoreTemp), &(&1 =~ "override"))
       assert Enum.any?(labels.(Op.ControlRods), &(&1 =~ "predictive"))
+      assert Enum.any?(labels.(Op.ControlRods), &(&1 =~ "hybrid"))
       assert Enum.any?(labels.(Module.concat(Op.SecondaryFill, "L2")), &(&1 =~ "Boost"))
     end
 
@@ -106,6 +107,87 @@ defmodule AutoNuke.Tui.OperatorsTest do
 
       assert {:error, msg} = action.run.(["banana"])
       assert msg =~ "not a number"
+    end
+
+    test "CoreTemp offers holding the core temperature" do
+      labels = Operators.actions(Op.CoreTemp) |> Enum.map(& &1.label)
+
+      assert "Hold core temperature at current" in labels
+      assert "Hold core temperature at (°C)" in labels
+    end
+
+    test "hold actions come after the override actions, so their menu positions are stable" do
+      labels = Operators.actions(Op.CoreTemp) |> Enum.map(& &1.label)
+
+      # Enable(0), Set override(1), Clear override(2), then the holds.
+      assert [_, "Set temperature override (°C)", "Clear temperature override" | holds] = labels
+      assert Enum.all?(holds, &(&1 =~ "Hold"))
+    end
+
+    test "holding at the current temperature against a stopped operator reports, not crashes" do
+      MockAPI.mock_get("CORE_TEMP", 340.0)
+
+      action =
+        Operators.actions(Op.CoreTemp)
+        |> Enum.find(&(&1.label == "Hold core temperature at current"))
+
+      assert action.params == []
+      assert {:error, "Not running."} = action.run.([])
+    end
+
+    test "holding at a given temperature against a stopped operator reports, not crashes" do
+      action =
+        Operators.actions(Op.CoreTemp)
+        |> Enum.find(&(&1.label == "Hold core temperature at (°C)"))
+
+      assert {:error, "Not running."} = action.run.(["330"])
+    end
+
+    test "non-numeric hold input reports, not crashes" do
+      action =
+        Operators.actions(Op.CoreTemp)
+        |> Enum.find(&(&1.label == "Hold core temperature at (°C)"))
+
+      assert {:error, msg} = action.run.(["banana"])
+      assert msg =~ "not a number"
+    end
+  end
+
+  describe "BoronLevel actions" do
+    test "offers setting a concentration and going back to the rods" do
+      labels = Operators.actions(Op.BoronLevel) |> Enum.map(& &1.label)
+
+      assert "Set boron concentration (ppm)" in labels
+      assert "Follow control rods again" in labels
+    end
+
+    test "setting a concentration against a stopped operator reports, not crashes" do
+      action =
+        Operators.actions(Op.BoronLevel)
+        |> Enum.find(&(&1.label == "Set boron concentration (ppm)"))
+
+      assert {:error, "Not running."} = action.run.(["3000"])
+    end
+
+    test "non-numeric concentration reports, not crashes" do
+      action =
+        Operators.actions(Op.BoronLevel)
+        |> Enum.find(&(&1.label == "Set boron concentration (ppm)"))
+
+      assert {:error, msg} = action.run.(["lots"])
+      assert msg =~ "not a number"
+    end
+  end
+
+  describe "prompt hints" do
+    # The operator prompt box clips "Label (hint)" to 36 columns.
+    test "every adjustment's prompt fits the box without being cut off" do
+      for entry <- Operators.list(),
+          action <- Operators.actions(entry.id),
+          param <- action.params do
+        text = "#{param.label} (#{param.hint})"
+        assert String.length(text) <= 36, "#{inspect(text)} would be clipped"
+      end
     end
   end
 

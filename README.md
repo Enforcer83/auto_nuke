@@ -51,6 +51,11 @@ The pre-TUI workflow still works (and is what the TUI uses under the hood):
 - [`CoreTemp`](lib/auto_nuke/operators/core_temp.ex) — Adjusts temperature target based on steam generator pressure.
   - Tries to ensure that all active steam generators average out to 60 bar of pressure.
   - Sends its calculated target to `ControlRods`.
+  - Can instead **hold** the core at a fixed temperature, either wherever it is right now or at a chosen value from 300°C to 400°C (`CoreTemp.hold`, or the "Hold core temperature" actions in the `[o]` operator menu).
+    - The target closes on the setpoint at 1°C a second, never more than 10°C above or 5°C below the core, so a cold core is brought up gently instead of the rods chasing a distant target.
+    - A hold never expires on its own, and it cancels any drift in progress. Starting a drift, setting an override or clearing the override ends the hold.
+    - While holding, temperature no longer steers pressure, so it is up to `SteamFlow` (valves and bypass) to keep the steam generators in check.
+    - "Clear temperature override" releases the hold; pressure-following resumes from the held temperature without a step.
 - [`ControlRods`](lib/auto_nuke/operators/control_rods.ex) — Uses control rods to achieve the target temperature.
   - Receives its target temperature from `CoreTemp`.
   - Due to both the target temperature constantly changing, and the difficulty in maintaining a precise temperature, this will unfortunately result in near-constant movement of the control rods.  Sorry for all the noise.
@@ -112,7 +117,7 @@ The pre-TUI workflow still works (and is what the TUI uses under the hood):
 
 ### Startup / shutdown
 
-- [`mix auto_nuke.startup`](lib/mix/tasks/startup.ex) — Starts a cold reactor.
+- [`mix auto_nuke.startup`](lib/mix/tasks/startup.ex) — Starts a cold reactor.  Optionally takes a core temperature as a third argument (`mix auto_nuke.startup <loops> <cores> 330`; leave loops and cores blank for all).  Startup then takes the steam generators to 60 bar (within 2 bar) and switches from its warm-up ramp to a `CoreTemp` hold at that temperature, which carries over to the supervised operators.  Without it, startup behaves as before.
 
 These need to be run via `task.sh` in order to set up communication with a running `AutoNuke` process:
 

@@ -53,6 +53,10 @@ defmodule AutoNuke.Tui.OverridesTest do
         assert [%{op: "ControlRods", desc: "direct mode"}] = Data.overrides()
       end)
 
+      with_stub(Op.ControlRods, %{get_mode: :hybrid}, fn ->
+        assert [%{op: "ControlRods", desc: "hybrid mode"}] = Data.overrides()
+      end)
+
       with_stub(Op.ControlRods, %{get_mode: :predictive}, fn ->
         assert Data.overrides() == []
       end)

@@ -35,7 +35,13 @@ defmodule AutoNuke.Operator.ControlRods do
   # Look ahead 5 more readings during control loop:
   @temp_lookahead 5
 
-  @modes [:predictive, :direct]
+  # Hybrid mode: aim at the look-ahead prediction while the core is further
+  # than this from target (it damps the approach, where :direct overshoots),
+  # and at the plain reading inside it (a straight-line fit through noisy
+  # readings is what stirs the rods near target in :predictive).
+  @hybrid_threshold 3.0
+
+  @modes [:predictive, :direct, :hybrid]
   @default_mode Enum.at(@modes, 0)
 
   def start_link(opts \\ []) do
@@ -203,11 +209,7 @@ defmodule AutoNuke.Operator.ControlRods do
     current_temp = get_verified_core_temp([state.last_temp])
     history = state.temp_history |> Smoother.add(current_temp)
 
-    measurement =
-      case state.mode do
-        :predictive -> Smoother.extrapolate(history, @temp_lookahead)
-        :direct -> current_temp
-      end
+    measurement = select_measurement(state.mode, state.target, current_temp, history)
 
     case ControlAxis.step(state.axis, state.target, measurement) do
       {:changed, axis, new, _old} -> {new, axis}
@@ -230,6 +232,18 @@ defmodule AutoNuke.Operator.ControlRods do
            temp_history: history
        }}
     end)
+  end
+
+  @doc false
+  def select_measurement(:predictive, _target, _current, history),
+    do: Smoother.extrapolate(history, @temp_lookahead)
+
+  def select_measurement(:direct, _target, current, _history), do: current
+
+  def select_measurement(:hybrid, target, current, history) do
+    if abs(target - current) > @hybrid_threshold,
+      do: select_measurement(:predictive, target, current, history),
+      else: current
   end
 
   # Anti-hunting gate: near the target, sub-@min_move commands are held —

@@ -13,7 +13,8 @@ defmodule AutoNuke.Operator.CoreTemp do
       monitored: nil,
       axis: nil,
       override: nil,
-      drift: nil
+      drift: nil,
+      hold: nil
     )
   end
 
@@ -67,6 +68,11 @@ defmodule AutoNuke.Operator.CoreTemp do
   # half the difference between current temperature and that boundary.
   @clamp_near_boundary 10
 
+  # A hold closes on its setpoint at this many °C per CoreTemp tick (one a
+  # second), the same 1°C/s the startup task ramps at.  Handing the rods a
+  # target hundreds of degrees away just winds them up and overshoots.
+  @hold_ramp 1.0
+
   def start_link(opts \\ []) do
     {loops, opts} = Keyword.pop(opts, :loops, :detect)
     opts = Keyword.put_new(opts, :name, __MODULE__)
@@ -95,6 +101,38 @@ defmodule AutoNuke.Operator.CoreTemp do
 
   def clear_override(pid \\ __MODULE__) do
     GenServer.call(pid, :clear_override)
+  end
+
+  @doc """
+  Hold the core at a fixed temperature, instead of letting the target move
+  to chase #{@target_pressure} bar.
+
+  `temp` is either a number of °C, or `:current` to hold wherever the core
+  is right now (rounded to the 0.1°C the game resolves).  It must lie within
+  `temp_range/0`; anything else is rejected with `{:error, message}` and
+  leaves the current behaviour untouched.  On success returns `{:ok, temp}`.
+
+  The target does not jump to `temp`.  It closes on it at 1°C a second, and
+  never gets further from the core than the usual clamps allow (10°C above,
+  5°C below), so a cold core is brought up gently instead of the rods being
+  asked to chase a target hundreds of degrees away.  Once it arrives the
+  target stays put.
+
+  A hold is an override as far as everything downstream (`ControlRods`,
+  `PrimaryPumps`) is concerned, and `get_override/1` shows the target as it
+  currently stands.  Unlike `set_override/3` it never expires by default
+  (`expiry` can be anything `AutoNuke.Time.parse_expiry/1` accepts), and it
+  cancels any drift in progress, since a drift would otherwise overwrite the
+  hold.  Starting a drift, `set_override/3` or `clear_override/1` ends the hold.
+
+  While held, pressure is no longer being steered by temperature: it is up to
+  `SteamFlow` (valves and bypass) to keep the steam generators in check.
+  Releasing the hold with `clear_override/1` resumes the pressure-following
+  target from wherever the hold had got to, with no step.
+  """
+  def hold(temp \\ :current, expiry \\ :never, pid \\ __MODULE__)
+      when temp == :current or is_number(temp) do
+    GenServer.call(pid, {:hold, resolve_hold_temp(temp), ANTime.parse_expiry(expiry)})
   end
 
   def drift(opts, pid \\ __MODULE__) do
@@ -181,14 +219,23 @@ defmodule AutoNuke.Operator.CoreTemp do
 
   @impl true
   def handle_call({:override, temp, expiry}, _from, %State{} = state) when is_float(temp) do
-    expires_desc =
-      case expiry do
-        :never -> "does not expire"
-        ts -> "expires at #{ANTime.timestamp_to_string(ts)}"
-      end
+    Logger.info(@log_prefix <> "Override set to #{temp}°C, #{describe_expiry(expiry)}.")
+    {:reply, :ok, %State{state | override: {temp, expiry}, hold: nil}}
+  end
 
-    Logger.info(@log_prefix <> "Override set to #{temp}°C, #{expires_desc}.")
-    {:reply, :ok, %State{state | override: {temp, expiry}}}
+  @impl true
+  def handle_call({:hold, temp, expiry}, _from, %State{} = state) when is_float(temp) do
+    # Not `temp in @temp_range`: range membership is false for any float.
+    if temp >= @temp_range.first and temp <= @temp_range.last do
+      if state.drift != nil, do: Logger.info(@log_prefix <> "Cancelling drift in favour of hold.")
+      Logger.info(@log_prefix <> "Holding core at #{temp}°C, #{describe_expiry(expiry)}.")
+      {:reply, {:ok, temp}, %State{state | hold: {temp, expiry}, drift: nil}}
+    else
+      {:reply,
+       {:error,
+        "#{temp}°C is outside the allowed range of " <>
+          "#{@temp_range.first}-#{@temp_range.last}°C."}, state}
+    end
   end
 
   @impl true
@@ -199,13 +246,13 @@ defmodule AutoNuke.Operator.CoreTemp do
   @impl true
   def handle_call(:clear_override, _from, %State{} = state) do
     Logger.info(@log_prefix <> "Clearing override.")
-    {:reply, :ok, %State{state | override: nil}}
+    {:reply, :ok, %State{state | override: nil, hold: nil}}
   end
 
   @impl true
   def handle_call({:drift, %Drift{} = drift}, _from, %State{} = state) do
     Logger.info(@log_prefix <> "Now planning to drift #{Drift.describe(drift)}.")
-    {:reply, :ok, %State{state | drift: {drift, false}}}
+    {:reply, :ok, %State{state | drift: {drift, false}, hold: nil}}
   end
 
   @impl true
@@ -222,6 +269,7 @@ defmodule AutoNuke.Operator.CoreTemp do
     state =
       state
       |> apply_drift()
+      |> apply_hold()
       |> maybe_expire_override()
 
     monitored = state.monitored |> Enum.map(&MonitoredVessel.tick/1)
@@ -282,6 +330,44 @@ defmodule AutoNuke.Operator.CoreTemp do
     end
   end
 
+  defp apply_hold(%State{hold: nil} = state), do: state
+
+  defp apply_hold(%State{hold: {setpoint, expiry}} = state) do
+    if hold_expired?(expiry) do
+      Logger.notice(@log_prefix <> "Hold has expired.")
+      %State{state | hold: nil, override: nil}
+    else
+      # Carry on from wherever the target already is.
+      from =
+        case state.override do
+          {temp, _} -> temp
+          nil -> state.axis.last_value
+        end
+
+      core = get_core_temp()
+
+      target =
+        from
+        |> step_toward(setpoint, @hold_ramp)
+        |> max(min_relative(core))
+        |> min(max_relative(core))
+        |> Float.round(2)
+
+      if target == setpoint and from != setpoint do
+        Logger.info(@log_prefix <> "Hold has reached #{setpoint}°C.")
+      end
+
+      %State{state | override: {target, :never}}
+    end
+  end
+
+  defp hold_expired?(:never), do: false
+  defp hold_expired?(ts) when is_integer(ts), do: ANTime.get_current_time() >= ts
+
+  defp step_toward(from, to, step) when abs(to - from) <= step, do: to
+  defp step_toward(from, to, step) when to > from, do: from + step
+  defp step_toward(from, _to, step), do: from - step
+
   defp maybe_expire_override(%State{override: nil} = state), do: state
   defp maybe_expire_override(%State{override: {_, :never}} = state), do: state
 
@@ -315,6 +401,15 @@ defmodule AutoNuke.Operator.CoreTemp do
   end
 
   defp publish_core_temp(temp), do: PubSub.publish(:core_temp, {:core_temp, temp})
+
+  defp describe_expiry(:never), do: "does not expire"
+  defp describe_expiry(ts), do: "expires at #{ANTime.timestamp_to_string(ts)}"
+
+  # Resolved on the caller's side, so a failed temperature read is the
+  # caller's error and can't take the operator down.  The game only resolves
+  # 0.1°C, so there is no point holding a more precise value than that.
+  defp resolve_hold_temp(:current), do: Float.round(get_core_temp() / 1, 1)
+  defp resolve_hold_temp(temp) when is_number(temp), do: temp / 1
 
   @relative_low @temp_range.first + @clamp_near_boundary
   @relative_high @temp_range.last - @clamp_near_boundary

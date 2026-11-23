@@ -26,3 +26,7 @@ auto_nuke-*.tar
 # Runtime-toggleable settings persisted by the TUI.
 /auto_nuke.settings.json
 /tmp/
+
+# Personal TUI Run Scripts
+/*.bat
+/*.ps1

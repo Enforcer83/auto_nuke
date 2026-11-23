@@ -20,7 +20,7 @@ defmodule AutoNuke.Tui.Operators do
   # Supervisor child ids double as registered names.
   @entries [
     {Op.SteamFlow, "SteamFlow", "Works MSCVs and bypass to meet grid power demand"},
-    {Op.CoreTemp, "CoreTemp", "Picks the core temp target for 60 bar SG pressure"},
+    {Op.CoreTemp, "CoreTemp", "Picks core temp for 60 bar SG pressure, or holds it"},
     {Op.ControlRods, "ControlRods", "Moves control rods to hit the core temp target"},
     {Op.PrimaryPumps, "PrimaryPumps", "Scales primary pump speed with core temperature"},
     {Module.concat(Op.SecondaryFill, "L1"), "SecondaryFill L1",
@@ -32,7 +32,7 @@ defmodule AutoNuke.Tui.Operators do
     {Op.VacuumTank, "VacuumTank", "Holds condenser vacuum via OMSI/SMSI valves"},
     {Op.PCSTFill, "PCSTFill", "Keeps the Primary Coolant Storage Tank level in range"},
     {Op.CoreFill, "CoreFill", "Keeps core vessel fill level: pumps in, drains out"},
-    {Op.BoronLevel, "BoronLevel", "Doses or filters boron based on rod insertion"},
+    {Op.BoronLevel, "BoronLevel", "Doses or filters boron by rod insertion, or to a ppm"},
     {Op.CondenserFill, "CondenserFill", "Keeps condenser level 35-65%: pump or drain"},
     {Op.CondenserCooling, "CondenserCooling", "Runs the cooling pump as slow as it can get away with"},
     {Op.EmergencyPower, "EmergencyPower", "Starts diesel generators on station blackout"},
@@ -172,6 +172,16 @@ defmodule AutoNuke.Tui.Operators do
         label: "Clear temperature override",
         params: [],
         run: fn _ -> attempt(fn -> Op.CoreTemp.clear_override() end) end
+      },
+      %{
+        label: "Hold core temperature at current",
+        params: [],
+        run: fn _ -> attempt(fn -> Op.CoreTemp.hold(:current) end) end
+      },
+      %{
+        label: "Hold core temperature at (°C)",
+        params: [%{label: "Temperature", hint: "300-400"}],
+        run: fn [t] -> attempt(fn -> Op.CoreTemp.hold(to_num(t)) end) end
       }
     ]
   end
@@ -194,6 +204,26 @@ defmodule AutoNuke.Tui.Operators do
         label: "Mode: direct",
         params: [],
         run: fn _ -> attempt(fn -> Op.ControlRods.set_mode(:direct) end) end
+      },
+      %{
+        label: "Mode: hybrid",
+        params: [],
+        run: fn _ -> attempt(fn -> Op.ControlRods.set_mode(:hybrid) end) end
+      }
+    ]
+  end
+
+  defp extra_actions(Op.BoronLevel) do
+    [
+      %{
+        label: "Set boron concentration (ppm)",
+        params: [%{label: "Concentration", hint: "0-3500 ppm"}],
+        run: fn [ppm] -> attempt(fn -> Op.BoronLevel.set_concentration(to_num(ppm)) end) end
+      },
+      %{
+        label: "Follow control rods again",
+        params: [],
+        run: fn _ -> attempt(fn -> Op.BoronLevel.clear_concentration() end) end
       }
     ]
   end

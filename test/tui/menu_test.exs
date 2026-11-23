@@ -45,6 +45,14 @@ defmodule AutoNuke.Tui.MenuTest do
     assert Menu.build_args(item, ["all", "1,3"]) == ["all", "1,3"]
   end
 
+  test "startup takes an optional core temp as its third argument" do
+    item = Enum.find(Menu.items(), &(&1.id == :startup))
+    assert Menu.build_args(item, ["", "", "330"]) == ["", "", "330"]
+    assert Menu.build_args(item, ["1", "", "330"]) == ["1", "", "330"]
+    assert Menu.build_args(item, ["1", "2", ""]) == ["1", "2"]
+    assert Menu.build_args(item, ["", "", "", "3000"]) == ["", "", "", "3000"]
+  end
+
   test "build_args splits multi-valued params into separate args" do
     item = Enum.find(Menu.items(), &(&1.id == :valve))
     assert Menu.build_args(item, ["open", "A1 B2 DV01"]) == ["open", "A1", "B2", "DV01"]

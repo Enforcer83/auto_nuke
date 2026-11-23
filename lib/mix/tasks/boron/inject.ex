@@ -30,6 +30,16 @@ defmodule Mix.Tasks.AutoNuke.Boron.Inject do
 
   defp do_run(target, max_rate \\ "#{@max_rate}") do
     UI.init()
+
+    if AutoNuke.BoronTarget.operator_running?() do
+      # The operator owns the pumps; the core fill operators are running too.
+      AutoNuke.BoronTarget.reach(String.to_integer(target), :up)
+    else
+      do_inject(target, max_rate)
+    end
+  end
+
+  defp do_inject(target, max_rate) do
     Op.CoreFill.start_link()
     Op.PCSTFill.start_link()
 

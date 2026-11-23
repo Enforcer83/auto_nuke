@@ -9,6 +9,8 @@ defmodule AutoNuke.Operator.BoronLevel do
       dosing_rate: nil,
       filter_rate: nil,
       filter_ready: false,
+      # Concentration (ppm) to work toward, or nil to follow rod position:
+      target: nil,
       next_ready_check: 0,
       next_pump_check: nil
     )
@@ -28,6 +30,17 @@ defmodule AutoNuke.Operator.BoronLevel do
   # If filter pump does not turn on within 10 seconds, begin issuing warnings:
   @pump_check_interval 10 * tps
 
+  # When working toward a set concentration, slow the dosing pump as we
+  # close in (same easing as the startup task), and stop within this many ppm:
+  @target_easing 3
+  @target_tolerance 1.0
+  @dosing_max_rate 50
+
+  # The target concentration is kept in the settings file, so it survives
+  # restarts and the startup handover (nil/absent = follow the rods).
+  @target_setting "boron_target"
+  def target_setting, do: @target_setting
+
   @dosing_pump API.Pumps.boron_dosing()
   @filter_pump API.Pumps.boron_filter()
 
@@ -38,6 +51,24 @@ defmodule AutoNuke.Operator.BoronLevel do
 
   def get_dosing_rate, do: GenServer.call(__MODULE__, :get_dosing_rate)
   def get_filter_rate, do: GenServer.call(__MODULE__, :get_filter_rate)
+
+  @doc """
+  Work toward a boron concentration of `ppm` (0-#{@dosing_max_ppm}), instead of
+  following rod position.  Doses boron to raise it, or runs the ion exchange
+  to lower it, and keeps correcting until cleared.
+
+  Returns `{:ok, ppm}`, or `{:error, message}` when the target is out of
+  range or the pump needed to reach it isn't installed.
+  """
+  def set_concentration(ppm, pid \\ __MODULE__) when is_number(ppm),
+    do: GenServer.call(pid, {:set_concentration, ppm / 1})
+
+  @doc "Go back to following rod position."
+  def clear_concentration(pid \\ __MODULE__), do: GenServer.call(pid, :clear_concentration)
+
+  @doc "The concentration being worked toward, or `nil` when following the rods."
+  def get_concentration_target(pid \\ __MODULE__),
+    do: GenServer.call(pid, :get_concentration_target)
 
   @impl true
   def init(nil) do
@@ -54,7 +85,8 @@ defmodule AutoNuke.Operator.BoronLevel do
     boron = get_boron_ppm()
     filter_rate = @filter_pump |> API.Pumps.get_ordered_speed()
     dose_rate = @dosing_pump |> API.Pumps.get_ordered_speed()
-    state = %State{dosing_rate: dose_rate, filter_rate: filter_rate}
+    target = AutoNuke.Settings.get(@target_setting, nil)
+    state = %State{dosing_rate: dose_rate, filter_rate: filter_rate, target: target}
 
     PubSub.subscribe(self(), :ticker)
 
@@ -62,10 +94,53 @@ defmodule AutoNuke.Operator.BoronLevel do
       @log_prefix,
       "Started with boron at #{boron} ppm,",
       " dosing at #{dose_rate} g/min,",
-      " and filtration at #{filter_rate}%."
+      " and filtration at #{filter_rate}%.",
+      if(target, do: " Working toward #{target} ppm.", else: "")
     ])
 
     {:ok, state}
+  end
+
+  # Chemicals aren't enabled, so there is nothing to control.
+  @impl true
+  def handle_call({:set_concentration, _}, _from, nil) do
+    {:reply, {:error, "Boron chemicals are not enabled."}, nil}
+  end
+
+  @impl true
+  def handle_call({:set_concentration, ppm}, _from, %State{} = state) do
+    # Always a float, whoever calls (the public function converts too).
+    ppm = ppm / 1
+    current = get_boron_ppm()
+
+    cond do
+      ppm < 0 or ppm > @dosing_max_ppm ->
+        {:reply, {:error, "#{ppm} ppm is outside the allowed range of 0-#{@dosing_max_ppm} ppm."},
+         state}
+
+      ppm > current and not API.Pumps.installed?(@dosing_pump) ->
+        {:reply, {:error, "No boron dosing pump installed, can't raise boron."}, state}
+
+      ppm < current and not API.Pumps.installed?(@filter_pump) ->
+        {:reply, {:error, "No ion exchange pump installed, can't lower boron."}, state}
+
+      true ->
+        Logger.info(@log_prefix <> "Working toward #{ppm} ppm (now #{current} ppm).")
+        AutoNuke.Settings.put(@target_setting, ppm)
+        {:reply, {:ok, ppm}, %State{state | target: ppm}}
+    end
+  end
+
+  @impl true
+  def handle_call(:clear_concentration, _from, %State{} = state) do
+    if state.target, do: Logger.info(@log_prefix <> "Following control rod position again.")
+    AutoNuke.Settings.put(@target_setting, nil)
+    {:reply, :ok, %State{state | target: nil}}
+  end
+
+  @impl true
+  def handle_call(:get_concentration_target, _from, %State{target: target} = state) do
+    {:reply, target, state}
   end
 
   @impl true
@@ -83,17 +158,45 @@ defmodule AutoNuke.Operator.BoronLevel do
 
   @impl true
   def handle_info({:tick, t}, %State{} = state) do
-    rods = API.get_float("RODS_POS_ACTUAL")
+    {dosing, filtering} = desired_rates(state.target)
 
     {:noreply,
      state
-     |> tick_dosing(rods)
-     |> tick_filter(rods, t)}
+     |> tick_dosing(dosing)
+     |> tick_filter(filtering, t)}
   end
 
-  defp tick_dosing(%State{dosing_rate: old} = state, rods) do
-    new = calculate_dosing_rate(rods)
+  # Following the rods:
+  defp desired_rates(nil) do
+    rods = API.get_float("RODS_POS_ACTUAL")
+    {calculate_dosing_rate(rods), calculate_filter_rate(rods)}
+  end
 
+  # Working toward a set concentration:
+  defp desired_rates(target) do
+    ppm = get_boron_ppm()
+    {target_dosing_rate(ppm, target), target_filter_rate(ppm, target)}
+  end
+
+  @doc false
+  def target_dosing_rate(ppm, target) when target - ppm < @target_tolerance, do: 0
+
+  def target_dosing_rate(ppm, target) do
+    ((target - ppm) / @target_easing)
+    |> ceil()
+    |> min(@dosing_max_rate)
+  end
+
+  @doc false
+  def target_filter_rate(ppm, target) when ppm - target < @target_tolerance, do: 0
+
+  def target_filter_rate(ppm, target) do
+    (ppm - target)
+    |> ceil()
+    |> min(100)
+  end
+
+  defp tick_dosing(%State{dosing_rate: old} = state, new) do
     if new != old do
       Logger.info(@log_prefix <> "Changing dosing rate from #{old} to #{new} g/min.")
       @dosing_pump |> API.Pumps.set_speed(new)
@@ -103,9 +206,8 @@ defmodule AutoNuke.Operator.BoronLevel do
     end
   end
 
-  defp tick_filter(%State{filter_rate: old} = state, rods, t) do
+  defp tick_filter(%State{filter_rate: old} = state, new, t) do
     state = ready_check(state, t)
-    new = calculate_filter_rate(rods)
 
     if new != old do
       if state.filter_ready || new == 0 do
@@ -197,7 +299,8 @@ defmodule AutoNuke.Operator.BoronLevel do
 
   # Not time for another check yet:
   defp pump_check(%State{next_pump_check: next} = state, curr, _)
-       when is_integer(next) and curr < next, do: state
+       when is_integer(next) and curr < next,
+       do: state
 
   # Filtration is requested, and it's time for a check:
   defp pump_check(%State{} = state, t, f) when f > 0 do

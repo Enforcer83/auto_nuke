@@ -12,6 +12,8 @@ defmodule Mix.Tasks.AutoNuke.Startup do
 
   # Target PPM for boron injection:
   @boron_target 3300
+  # Boron has no effect beyond this (see the BoronLevel operator):
+  @boron_max 3500
   # How carefully to inject boron (higher = more):
   @boron_easing 3
   # At easing of 3, we start slowing down when boron PPM is
@@ -46,6 +48,10 @@ defmodule Mix.Tasks.AutoNuke.Startup do
   # Clamp this at 10°C above the current actual temperature.
   @core_temp_max_delta 10
 
+  # With a core temp option, regulation starts once every steam generator
+  # is within this many bar of @bypass_target_pressure:
+  @pressure_tolerance 2
+
   def run(args), do: run(args, [])
 
   def run([], opts) do
@@ -72,6 +78,24 @@ defmodule Mix.Tasks.AutoNuke.Startup do
     )
   end
 
+  # Optional third and fourth arguments: the core temperature (°C) to regulate
+  # at once the steam generators reach 60 bar, and the boron concentration (ppm)
+  # to inject up to.  Any of the four may be blank, meaning "default".
+  def run([loops, cores, temp], opts), do: run([loops, cores, temp, ""], opts)
+
+  def run([loops, cores, temp, boron], opts) do
+    opts =
+      opts
+      |> put_unless_blank(:core_temp, temp, &parse_core_temp/1)
+      |> put_unless_blank(:boron_target, boron, &parse_boron_target/1)
+
+    startup(
+      if(blank?(loops), do: &get_installed_secondary_loops/0, else: parse_loops(loops)),
+      if(blank?(cores), do: &get_loaded_core_bays/0, else: parse_cores(cores)),
+      opts
+    )
+  end
+
   @loop_emoji "\u{1F501}"
   @core_emoji "\u{2622}\u{FE0F}"
 
@@ -93,14 +117,15 @@ defmodule Mix.Tasks.AutoNuke.Startup do
 
     {:ok, _} = Op.CoreFill.start_link()
     {:ok, _} = Op.PCSTFill.start_link()
-    if using_boron?(), do: begin_injecting_boron()
+    boron_target = Keyword.get(opts, :boron_target, @boron_target)
+    if using_boron?(), do: begin_injecting_boron(boron_target)
     start_pressurizer()
     start_primary_circulation(loops, @startup_primary_speed)
     start_condenser()
     open_steam_valves(loops)
     capacity = enable_resistor_bank()
 
-    wait_before_load_fuel(loops)
+    wait_before_load_fuel(loops, boron_target)
     {:ok, _} = Op.CondenserCooling.start_link()
     load_fuel(cores)
 
@@ -126,14 +151,28 @@ defmodule Mix.Tasks.AutoNuke.Startup do
     reduce_bypass(loops)
     wait_for_temperature(@turbine_temp)
 
+    core_temp = Keyword.get(opts, :core_temp)
+
+    if core_temp do
+      wait_for_pressure(loops)
+      begin_regulating(core_temp)
+    end
+
     request_connection()
     start_turbine(loops)
 
     {:ok, _} = Op.SteamFlow.start_link(loops: loops, override: {capacity / 3, :mw})
-    send(:core_temp_override, :exit)
+    # With a core temp option the ramp helper already handed over to the hold.
+    unless core_temp, do: send(:core_temp_override, :exit)
 
     connect_to_grid(loops)
     Op.SteamFlow.set_target_override_percent(100)
+
+    # Carry an explicitly requested boron concentration over to the
+    # BoronLevel operator, which reads it when it starts.
+    if Keyword.has_key?(opts, :boron_target) and using_boron?() do
+      AutoNuke.Settings.put(Op.BoronLevel.target_setting(), boron_target)
+    end
 
     UI.console("ALL")
 
@@ -147,6 +186,8 @@ defmodule Mix.Tasks.AutoNuke.Startup do
       :adopt ->
         UI.set("Operator", "TAKE OVER")
         AutoNuke.Operator.Handoff.adopt()
+        # Adoption replaces the operators with fresh ones, which lose the hold.
+        if core_temp, do: begin_regulating(core_temp, ramp_helper: false)
         UI.success("Supervised operators are running the plant.")
     end
   end
@@ -278,7 +319,7 @@ defmodule Mix.Tasks.AutoNuke.Startup do
     IO.gets("Press enter when ready to start ...")
   end
 
-  defp wait_before_load_fuel(loops) do
+  defp wait_before_load_fuel(loops, boron_target) do
     UI.console("Pressurizer")
 
     UI.ProgressBar.wait(
@@ -290,7 +331,7 @@ defmodule Mix.Tasks.AutoNuke.Startup do
 
     if using_boron?() do
       UI.console("Chemical Treatment")
-      target = @boron_target - 50
+      target = max(boron_target - 50, 0)
 
       UI.ProgressBar.wait(
         config: UI.ProgressBar.Config.target(0, target, " ppm"),
@@ -450,9 +491,69 @@ defmodule Mix.Tasks.AutoNuke.Startup do
           increase_temp_target_loop(new)
         end
 
+      # Stop ramping but leave the override alone: a hold is taking over.
+      :hold ->
+        Op.ControlRods.set_mode(:predictive)
+
       :exit ->
         Op.CoreTemp.clear_override()
         Op.ControlRods.set_mode(:predictive)
+    end
+  end
+
+  # Wait until every steam generator is at (about) the bypass target pressure.
+  defp wait_for_pressure(loops) do
+    UI.console("Steam Generator")
+
+    loops
+    |> Enum.each(fn loop ->
+      steam_gen = API.SteamGen.for_loop(loop)
+      target = @bypass_target_pressure
+
+      UI.ProgressBar.wait(
+        config: UI.ProgressBar.Config.target(0, target, " bar"),
+        label: "SG #{loop} pressure",
+        current_fn: fn -> API.SteamGen.get_pressure(steam_gen) end,
+        done_fn: &(abs(&1 - target) <= @pressure_tolerance)
+      )
+    end)
+  end
+
+  # Hand temperature control from the startup ramp to a CoreTemp hold.
+  # The hold ramps on from wherever the override is, so there is no step.
+  defp begin_regulating(temp, opts \\ []) do
+    UI.console("Reactor Core")
+
+    if Keyword.get(opts, :ramp_helper, true) do
+      case Process.whereis(:core_temp_override) do
+        pid when is_pid(pid) -> send(pid, :hold)
+        nil -> :noop
+      end
+    end
+
+    case Op.CoreTemp.hold(temp) do
+      {:ok, held} -> UI.success("Regulating core temperature at #{held}°C.")
+      {:error, msg} -> UI.warn(msg)
+    end
+  end
+
+  defp blank?(arg), do: String.trim(arg) == ""
+
+  defp put_unless_blank(opts, key, arg, parse) do
+    if blank?(arg), do: opts, else: Keyword.put(opts, key, parse.(arg))
+  end
+
+  defp parse_boron_target(ppm) do
+    case Float.parse(String.trim(ppm)) do
+      {n, ""} when n >= 0 and n <= @boron_max -> n
+      _ -> Mix.raise("Boron must be a number from 0 to #{@boron_max} (ppm), got: #{ppm}")
+    end
+  end
+
+  defp parse_core_temp(temp) do
+    case Float.parse(String.trim("#{temp}")) do
+      {n, ""} when n >= 300 and n <= 400 -> n
+      _ -> Mix.raise("Core temp must be a number from 300 to 400 (°C), got: #{temp}")
     end
   end
 
@@ -672,7 +773,7 @@ defmodule Mix.Tasks.AutoNuke.Startup do
     end)
   end
 
-  defp begin_injecting_boron do
+  defp begin_injecting_boron(boron_target) do
     UI.console("Chemical Treatment")
 
     init_boron = API.get_float("CHEM_BORON_PPM")
@@ -680,34 +781,34 @@ defmodule Mix.Tasks.AutoNuke.Startup do
     UI.set_wait(
       "Boron Injection",
       "BEGIN",
-      fn -> API.get_float("CHEM_BORON_PPM") > min(init_boron, @boron_target) end,
+      fn -> API.get_float("CHEM_BORON_PPM") > min(init_boron, boron_target) end,
       fn ->
         spawn_link(fn ->
           # Ensure only one:
           Process.register(self(), :boron_injector)
           PubSub.subscribe(self(), :ticker)
-          inject_boron_loop()
+          inject_boron_loop(boron_target)
         end)
       end
     )
   end
 
-  defp inject_boron_loop do
+  defp inject_boron_loop(boron_target) do
     receive do
       {:tick, _} ->
         ppm = API.get_float("CHEM_BORON_PPM")
 
         rate =
-          if ppm >= @boron_target do
+          if ppm >= boron_target do
             0
           else
-            ((@boron_target - ppm) / @boron_easing)
+            ((boron_target - ppm) / @boron_easing)
             |> ceil()
             |> min(50)
           end
 
         API.put("CHEM_BORON_DOSAGE_ORDERED_RATE", rate)
-        inject_boron_loop()
+        inject_boron_loop(boron_target)
     end
   end
 

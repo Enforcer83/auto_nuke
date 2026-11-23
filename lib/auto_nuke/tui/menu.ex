@@ -19,7 +19,13 @@ defmodule AutoNuke.Tui.Menu do
         label: "Startup — cold start the reactor",
         params: [
           %{label: "Loops", hint: "blank = all installed; e.g. 1, 1..2, 1,3", optional: true},
-          %{label: "Cores", hint: "blank = all loaded bays; e.g. 1..3", optional: true}
+          %{label: "Cores", hint: "blank = all loaded bays; e.g. 1..3", optional: true},
+          %{
+            label: "Core temp (°C)",
+            hint: "300-400°C; blank = don't hold",
+            optional: true
+          },
+          %{label: "Boron (ppm)", hint: "0-3500; blank = 3300", optional: true}
         ],
         task: T.Startup,
         # In the TUI, startup ends by handing the plant to supervised

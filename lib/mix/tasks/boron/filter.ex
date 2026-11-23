@@ -25,10 +25,16 @@ defmodule Mix.Tasks.AutoNuke.Boron.Filter do
     UI.init()
     ppm = get_boron_ppm()
 
-    if ppm > target do
-      filter_boron(target, max_speed)
-    else
-      UI.success("Boron PPM is #{ppm}.")
+    cond do
+      # The operator owns the pumps; have it do the filtering.
+      AutoNuke.BoronTarget.operator_running?() ->
+        AutoNuke.BoronTarget.reach(target, :down)
+
+      ppm > target ->
+        filter_boron(target, max_speed)
+
+      true ->
+        UI.success("Boron PPM is #{ppm}.")
     end
   end
 

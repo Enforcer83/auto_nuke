@@ -99,6 +99,7 @@ defmodule AutoNuke.Tui.Data do
   defp rods_mode do
     case safe_call(Op.ControlRods, :get_mode) do
       :direct -> %{op: "ControlRods", desc: "direct mode"}
+      :hybrid -> %{op: "ControlRods", desc: "hybrid mode"}
       _ -> nil
     end
   end
